@@ -38,7 +38,7 @@ class PreparedSelfUpdate internal constructor(
 internal class SelfUpdateSnapshot(source: File, val size: Long, private val unlinkOnOpen: Boolean = false) : Closeable {
     private val descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
     private val initial = try {
-        Os.fstat(descriptor.fileDescriptor).also { if (unlinkOnOpen) Os.unlink(source.path) }
+        Os.fstat(descriptor.fileDescriptor).also { if (unlinkOnOpen) Os.remove(source.path) }
     } catch (error: Exception) {
         runCatching { descriptor.close() }
         throw error
