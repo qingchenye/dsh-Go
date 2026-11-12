@@ -1,0 +1,89 @@
+# Temporary, never merged. For requestfromweb-030: nine runtime Kotlin test classes per-method results + androidTest compile.
+name: reverse-030
+
+on:
+  push:
+    branches: [reverse/refactor5-030]
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  GRADLE_VERSION: 9.3.1
+  NODE_VERSION: 24.22.1
+  TZ: Asia/Shanghai
+
+jobs:
+  kotlin:
+    name: R030 kotlin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DSH_MAVEN_MIRRORS: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+      - name: Environment and plugins
+        working-directory: app
+        run: |
+          set +e
+          : > "$RUNNER_TEMP/codes.txt"
+          echo "R030: head=$(git rev-parse HEAD)"
+          echo "R030: $(java -version 2>&1 | head -1) | $(gradle --version 2>&1 | grep -E '^Gradle')"
+          flutter pub get --enforce-lockfile
+          c=$?
+          echo "R030: pub-get exit=$c"
+          echo "pub-get $c" >> "$RUNNER_TEMP/codes.txt"
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+          exit 0
+      - name: Named test classes
+        working-directory: app/android
+        run: |
+          set +e
+          gradle --console=plain --stacktrace :app:cleanTestArm64DebugUnitTest :app:testArm64DebugUnitTest --tests '*LastKnownGoodReadTest*' --tests '*LastKnownGoodBootTest*' --tests '*LastKnownGoodTawcProfileTest*' --tests '*TawcrootLinksTest*' --tests '*TawcrootLinksSpecialTest*' --tests '*RuntimeUpgradeCompatibilityTest*' --tests '*RuntimeUpgradeIntegrationTest*' --tests '*RuntimeDurabilityTest*' --tests '*EngineUpgradeTest*' 2>&1 | tee "$RUNNER_TEMP/g1.log"
+          c=${PIPESTATUS[0]}
+          echo "R030: gradle exit=$c"
+          grep -E '^> Task :app:(cleanTest|test)Arm64DebugUnitTest|^e: |error:|FAILED|BUILD ' "$RUNNER_TEMP/g1.log" | sed 's/^/R030: g1-line: /'
+          echo "gradle $c" >> "$RUNNER_TEMP/codes.txt"
+          python3 -I "$GITHUB_WORKSPACE/.reverse/030/junit.py" R030 "$GITHUB_WORKSPACE/app/build/app/test-results/testArm64DebugUnitTest" LastKnownGoodReadTest LastKnownGoodBootTest LastKnownGoodTawcProfileTest TawcrootLinksTest TawcrootLinksSpecialTest RuntimeUpgradeCompatibilityTest RuntimeUpgradeIntegrationTest RuntimeDurabilityTest EngineUpgradeTest
+          p=$?
+          echo "R030: junit exit=$p"
+          echo "junit $p" >> "$RUNNER_TEMP/codes.txt"
+          exit 0
+      - name: Compile androidTest only
+        working-directory: app/android
+        run: |
+          set +e
+          gradle --console=plain tasks --all 2>&1 | grep -i AndroidTestKotlin | sed 's/^/R030: task-list: /'
+          gradle --console=plain --stacktrace :app:compileArm64DebugAndroidTestKotlin 2>&1 | tee "$RUNNER_TEMP/g2.log"
+          c=${PIPESTATUS[0]}
+          echo "R030: androidTest compile exit=$c"
+          grep -E '^> Task :app:compile.*AndroidTest|^e: |error:|FAILED|BUILD ' "$RUNNER_TEMP/g2.log" | sed 's/^/R030: g2-line: /'
+          echo "androidtest-compile $c" >> "$RUNNER_TEMP/codes.txt"
+          exit 0
+      - name: Verdict from recorded exit codes
+        run: |
+          set +e
+          cat "$RUNNER_TEMP/codes.txt" | sed 's/^/R030: code: /'
+          bad=$(awk '$2 != 0' "$RUNNER_TEMP/codes.txt" | wc -l)
+          echo "R030: nonzero-count=$bad"
+          if [ "$bad" -ne 0 ]; then
+            echo "R030: VERDICT FAIL"
+            exit 1
+          fi
+          echo "R030: VERDICT PASS"
+
