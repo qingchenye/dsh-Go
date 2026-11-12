@@ -35,15 +35,22 @@ class PreparedSelfUpdate internal constructor(
     }
 }
 
-internal class SelfUpdateSnapshot(val file: File, val size: Long) : Closeable {
-    private val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-    private val initial = Os.fstat(descriptor.fileDescriptor)
+internal class SelfUpdateSnapshot(source: File, val size: Long, private val unlinkOnOpen: Boolean = false) : Closeable {
+    private val descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
+    private val initial = try {
+        Os.fstat(descriptor.fileDescriptor).also { if (unlinkOnOpen) Os.unlink(source.path) }
+    } catch (error: Exception) {
+        runCatching { descriptor.close() }
+        throw error
+    }
+    val file: File = if (unlinkOnOpen) File("/proc/self/fd/${descriptor.fd}") else source
 
     fun verifyPath() {
-        val current = Os.lstat(file.path)
+        val held = Os.fstat(descriptor.fileDescriptor)
+        val current = if (unlinkOnOpen) held else Os.lstat(file.path)
         if (!OsConstants.S_ISREG(current.st_mode) || current.st_dev != initial.st_dev ||
             current.st_ino != initial.st_ino || current.st_size != size ||
-            Os.fstat(descriptor.fileDescriptor).st_size != size)
+            held.st_size != size)
             throw SelfUpdateException("snapshotChanged")
     }
 
@@ -65,8 +72,8 @@ internal class SelfUpdateSnapshot(val file: File, val size: Long) : Closeable {
 
     override fun close() {
         runCatching { descriptor.close() }
-        // Only this randomly named, privately created snapshot is ever removed.
-        file.delete()
+        // An unlinked snapshot belongs only to the held descriptor, never to a later path occupant.
+        if (!unlinkOnOpen) file.delete()
     }
 }
 
