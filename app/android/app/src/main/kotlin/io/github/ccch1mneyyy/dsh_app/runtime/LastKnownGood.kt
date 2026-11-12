@@ -218,8 +218,8 @@ object LastKnownGood {
     }
 
     /**
-     * DSH's writer lock (`dsh-atomic-write`): a sibling `<file>.lock` created exclusively,
-     * holding the writer's pid. Dead-holder takeover is serialized by the same record-hash claim.
+     * DSH's writer lock (`dsh-atomic-write`): publish a complete PID through an exclusive
+     * sibling symlink. Dead-holder takeover still uses the same record-hash claim.
      */
     internal fun <T> withLock(
         file: File, busyConfig: String,
@@ -229,19 +229,26 @@ object LastKnownGood {
     ): T {
         val lock = File(file.path + ".lock")
         val deadline = System.currentTimeMillis() + 3000
-        while (true) {
-            if (lock.createNewFile()) {
-                break
-            }
-            if (takeOverExitedLock(lock, ownPid, exited)) continue
-            if (System.currentTimeMillis() > deadline) throw IllegalStateException(busyConfig)
-            Thread.sleep(50)
-        }
+        val owner = File.createTempFile(".dsh-lkg-lock-", ".pid", file.parentFile)
+        var published = false
         try {
-            lock.writeText("$ownPid\n")
+            owner.writeText("$ownPid\n")
+            while (true) {
+                try {
+                    Files.createSymbolicLink(lock.toPath(), owner.toPath().fileName)
+                    published = true
+                    break
+                } catch (_: FileAlreadyExistsException) {
+                    // The existing writer keeps the same lock name and PID-text contract.
+                }
+                if (takeOverExitedLock(lock, ownPid, exited)) continue
+                if (System.currentTimeMillis() > deadline) throw IllegalStateException(busyConfig)
+                Thread.sleep(50)
+            }
             return block()
         } finally {
-            lock.delete()
+            // Keep the complete PID target if unlink fails; never leave our lock dangling.
+            if (!published || lock.delete()) owner.delete()
         }
     }
 
