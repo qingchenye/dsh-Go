@@ -1,5 +1,16 @@
+// Dead-holder takeover adapted from @deepseek-ai/dsh-atomic-write 0.2.2-rc.1, lib/index.js.
+// Copyright (c) 2026 DeepSeek; MIT license: THIRD_PARTY_NOTICES.md (DeepSeek Harness).
+// Modified for synchronous native restoration with the existing wait limit.
 package io.github.ccch1mneyyy.dsh_app.runtime
 
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import java.nio.ByteBuffer
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.MessageDigest
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -208,31 +219,68 @@ object LastKnownGood {
 
     /**
      * DSH's writer lock (`dsh-atomic-write`): a sibling `<file>.lock` created exclusively,
-     * holding the writer's pid; a lock whose pid no longer exists is taken over.
+     * holding the writer's pid. Dead-holder takeover is serialized by the same record-hash claim.
      */
-    private fun <T> withLock(file: File, busyConfig: String, block: () -> T): T {
+    internal fun <T> withLock(
+        file: File, busyConfig: String,
+        ownPid: Int = android.os.Process.myPid(),
+        exited: (Int) -> Boolean = ::processExited,
+        block: () -> T,
+    ): T {
         val lock = File(file.path + ".lock")
         val deadline = System.currentTimeMillis() + 3000
         while (true) {
             if (lock.createNewFile()) {
                 break
             }
-            val holder = try {
-                lock.readText().trim().toIntOrNull()
-            } catch (_: Exception) {
-                null
-            }
-            if (holder != null && !File("/proc/$holder").exists()) {
-                if (lock.delete()) continue
-            }
+            if (takeOverExitedLock(lock, ownPid, exited)) continue
             if (System.currentTimeMillis() > deadline) throw IllegalStateException(busyConfig)
             Thread.sleep(50)
         }
         try {
-            lock.writeText("${android.os.Process.myPid()}\n")
+            lock.writeText("$ownPid\n")
             return block()
         } finally {
             lock.delete()
+        }
+    }
+
+    private fun processExited(pid: Int): Boolean = try {
+        Os.kill(pid, 0)
+        false
+    } catch (error: ErrnoException) {
+        error.errno == OsConstants.ESRCH
+    }
+
+    private fun takeOverExitedLock(lock: File, ownPid: Int, exited: (Int) -> Boolean): Boolean {
+        fun readRecord(): String? = try { lock.readText() } catch (_: Exception) { null }
+        fun holderExited(record: String): Boolean {
+            if (!Regex("[0-9]+\\n").matches(record)) return false
+            val pid = record.dropLast(1).toIntOrNull() ?: return false
+            return pid > 0 && pid != ownPid && exited(pid)
+        }
+        val record = readRecord() ?: return false
+        if (!holderExited(record)) return false
+        val hash = MessageDigest.getInstance("SHA-256").digest(record.toByteArray(Charsets.UTF_8))
+            .take(8).joinToString("") { (it.toInt() and 255).toString(16).padStart(2, '0') }
+        val claim = File(lock.path + ".takeover-" + hash)
+        val channel = try {
+            Files.newByteChannel(claim.toPath(), setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+        } catch (_: FileAlreadyExistsException) {
+            // Existing claims, including empty or dead ones, require operator recovery.
+            return false
+        }
+        try {
+            channel.use {
+                val bytes = ByteBuffer.wrap("$ownPid\n".toByteArray(Charsets.UTF_8))
+                while (bytes.hasRemaining()) it.write(bytes)
+            }
+            if (readRecord() != record || !holderExited(record)) return false
+            return lock.delete()
+        } finally {
+            // We created this claim; failures while writing it must not strand it.
+            claim.delete()
         }
     }
 
