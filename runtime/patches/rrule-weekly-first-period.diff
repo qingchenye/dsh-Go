@@ -1,0 +1,48 @@
+--- a/node_modules/rrule/dist/es5/rrule.js
++++ b/node_modules/rrule/dist/es5/rrule.js
+@@ -228,8 +228,13 @@
+-var datetime = function (y, m, d, h, i, s) {
++var datetime = function (y, m, d, h, i, s, ms) {
+     if (h === void 0) { h = 0; }
+     if (i === void 0) { i = 0; }
+     if (s === void 0) { s = 0; }
+-    return new Date(Date.UTC(y, m - 1, d, h, i, s));
++    if (ms === void 0) { ms = 0; }
++    // A complete first week may start in year 0099; Date.UTC remaps years 0-99.
++    var earlyYear = y >= 0 && y < 100;
++    var date = new Date(Date.UTC(earlyYear ? y + 400 : y, m - 1, d, h, i, s, ms));
++    if (earlyYear) date.setUTCFullYear(date.getUTCFullYear() - 400);
++    return date;
+ };
+ /**
+  * General date-related utilities.
+@@ -328,7 +333,7 @@
+  */
+ var combine = function (date, time) {
+     time = time || date;
+-    return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), time.getHours(), time.getMinutes(), time.getSeconds(), time.getMilliseconds()));
++    return datetime(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), time.getHours(), time.getMinutes(), time.getSeconds(), time.getMilliseconds());
+ };
+ var dateutil_clone = function (date) {
+     var dolly = new Date(date.getTime());
+@@ -1797,7 +1802,7 @@
+         return getWeekday(new Date(this.getTime()));
+     };
+     DateTime.prototype.getTime = function () {
+-        return new Date(Date.UTC(this.year, this.month - 1, this.day, this.hour, this.minute, this.second, this.millisecond)).getTime();
++        return datetime(this.year, this.month, this.day, this.hour, this.minute, this.second, this.millisecond).getTime();
+     };
+     DateTime.prototype.getDay = function () {
+         return this.day;
+@@ -2983,6 +2988,11 @@
+         return emitResult(iterResult);
+     }
+     var counterDate = DateTime.fromDate(dtstart);
++    if (freq === Frequency.WEEKLY && notEmpty(bysetpos)) {
++        // Rank the complete week; the existing DTSTART cutoff still filters results.
++        var daysBefore = pymod(counterDate.getWeekday() - options.wkst, 7);
++        counterDate = DateTime.fromDate(new Date(dtstart.getTime() - daysBefore * ONE_DAY));
++    }
+     var ii = new iterinfo(options);
+     ii.rebuild(counterDate.year, counterDate.month);
+     var timeset = makeTimeset(ii, counterDate, options);
