@@ -188,20 +188,26 @@ class SelfUpdateInstallerService(private val context: Context) : ISelfUpdateInst
         try {
             // FileOutputStream(fd) leaves this caller-owned descriptor open on Android.
             val fd = Os.open(file.path, OsConstants.O_WRONLY or OsConstants.O_CREAT or OsConstants.O_EXCL or OsConstants.O_CLOEXEC, 384)
-            try {
-                ParcelFileDescriptor.AutoCloseInputStream(apk).use { input ->
-                    FileOutputStream(fd).use { output ->
-                        SelfUpdatePolicy.copyVerified(input, output, size, sha)
-                        output.fd.sync()
-                    }
-                }
-            } finally { Os.close(fd) }
-            Os.chmod(file.path, 256)
-            SelfUpdatePolicy.requireIdentity(Process.myUid())
-            val snapshot = SelfUpdateSnapshot(file, size)
+            val snapshot = try {
+                // Remove the name before copying; a killed helper must not leave a large APK behind.
+                SelfUpdateSnapshot(file, size, unlinkOnOpen = true)
+            } catch (error: Exception) {
+                Os.close(fd)
+                throw error
+            }
             snapshot.use {
+                try {
+                    ParcelFileDescriptor.AutoCloseInputStream(apk).use { input ->
+                        FileOutputStream(fd).use { output ->
+                            SelfUpdatePolicy.copyVerified(input, output, size, sha)
+                            output.fd.sync()
+                            Os.fchmod(fd, 256)
+                        }
+                    }
+                } finally { Os.close(fd) }
+                SelfUpdatePolicy.requireIdentity(Process.myUid())
                 it.verifyHash(sha)
-                SelfUpdateApks(context).validate(file, version)
+                SelfUpdateApks(context).validate(it.file, version)
                 it.verifyPath()
                 val child = ProcessBuilder(SelfUpdatePolicy.installArgv(userId, size)).apply {
                     environment().clear()
