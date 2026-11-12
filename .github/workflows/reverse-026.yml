@@ -1,0 +1,130 @@
+# Temporary, never merged. For requestfromweb-026: seven Kotlin test classes per-method results, plus safe-home-helper-live.mjs.
+name: reverse-026
+
+on:
+  push:
+    branches: [reverse/refactor5-026]
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  GRADLE_VERSION: 9.3.1
+  NODE_VERSION: 24.22.1
+  TZ: Asia/Shanghai
+
+jobs:
+  kotlin:
+    name: R026 kotlin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DSH_MAVEN_MIRRORS: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+      - name: Environment and plugins
+        working-directory: app
+        run: |
+          set +e
+          : > "$RUNNER_TEMP/codes.txt"
+          echo "R026: head=$(git rev-parse HEAD)"
+          echo "R026: $(java -version 2>&1 | head -1) | $(gradle --version 2>&1 | grep -E '^Gradle')"
+          flutter pub get --enforce-lockfile
+          c=$?
+          echo "R026: pub-get exit=$c"
+          echo "pub-get $c" >> "$RUNNER_TEMP/codes.txt"
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+          exit 0
+      - name: Seven test classes
+        working-directory: app/android
+        run: |
+          set +e
+          gradle --console=plain --stacktrace :app:cleanTestArm64DebugUnitTest :app:testArm64DebugUnitTest --tests '*GuestFilesTest*' --tests '*LastKnownGoodReadTest*' --tests '*SafeTawcPreflightTest*' --tests '*LastKnownGoodTawcProfileTest*' --tests '*LastKnownGoodLockTest*' --tests '*LastKnownGoodBootTest*' --tests '*LkgPlanTest*' 2>&1 | tee "$RUNNER_TEMP/g1.log"
+          c=${PIPESTATUS[0]}
+          echo "R026: gradle exit=$c"
+          grep -E '^> Task :app:(cleanTest|test)Arm64DebugUnitTest|^e: |error:|FAILED|BUILD ' "$RUNNER_TEMP/g1.log" | sed 's/^/R026: g1-line: /'
+          echo "gradle $c" >> "$RUNNER_TEMP/codes.txt"
+          python3 -I "$GITHUB_WORKSPACE/.reverse/026/junit.py" R026 "$GITHUB_WORKSPACE/app/build/app/test-results/testArm64DebugUnitTest" GuestFilesTest LastKnownGoodReadTest SafeTawcPreflightTest LastKnownGoodTawcProfileTest LastKnownGoodLockTest LastKnownGoodBootTest LkgPlanTest
+          p=$?
+          echo "R026: junit exit=$p"
+          echo "junit $p" >> "$RUNNER_TEMP/codes.txt"
+          exit 0
+      - name: Verdict from recorded exit codes
+        run: |
+          set +e
+          cat "$RUNNER_TEMP/codes.txt" | sed 's/^/R026: code: /'
+          bad=$(awk '$2 != 0' "$RUNNER_TEMP/codes.txt" | wc -l)
+          echo "R026: nonzero-count=$bad"
+          if [ "$bad" -ne 0 ]; then
+            echo "R026: VERDICT FAIL"
+            exit 1
+          fi
+          echo "R026: VERDICT PASS"
+
+  helperlive:
+    name: R026 safe-home-helper-live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Prepare a throwaway patched DSH (same recipe as ci.yml)
+        run: |
+          set +e
+          : > "$RUNNER_TEMP/codes.txt"
+          (
+            set -e
+            version=$(sed -nE 's/^DSH_VERSION="\$\{DSH_VERSION:-(.+)\}"$/\1/p' runtime/build-runtime.sh)
+            prefix="$RUNNER_TEMP/dsh"
+            mkdir "$prefix"
+            cp "runtime/locks/dsh-$version/package.json" "runtime/locks/dsh-$version/package-lock.json" "$prefix/"
+            npm ci --prefix "$prefix" --ignore-scripts --no-audit --no-fund
+            cp "$prefix/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js" "$prefix/fs-local-original.js"
+            python3 -I runtime/lib/rtbuild.py patch-dsh --prefix "$prefix" --dsh-version "$version"
+          )
+          c=$?
+          echo "R026: prepare exit=$c"
+          echo "prepare $c" >> "$RUNNER_TEMP/codes.txt"
+          exit 0
+      - name: Run safe-home-helper-live.mjs only
+        run: |
+          set +e
+          prefix="$RUNNER_TEMP/dsh"
+          export DSH_PREFIX="$prefix" DSH_TEST_PREFIX="$prefix" DSH_INSTALL="$prefix/node_modules/@deepseek-ai/dsh" DSH_TOOLS_DIR="$prefix/node_modules/@deepseek-ai/dsh-tools" DSH_FS_LOCAL_ORIGINAL_JS="$prefix/fs-local-original.js"
+          echo "R026: node $(node --version) head=$(git rev-parse HEAD)"
+          node --test runtime/tests/safe-home-helper-live.mjs 2>&1 | tee "$RUNNER_TEMP/live.log"
+          c=${PIPESTATUS[0]}
+          echo "R026: live exit=$c"
+          grep -E '^# (tests|pass|fail|cancelled|skipped|todo)|^(not ok|ok) ' "$RUNNER_TEMP/live.log" | sed 's/^/R026: live-line: /'
+          echo "live $c" >> "$RUNNER_TEMP/codes.txt"
+          exit 0
+      - name: Verdict from recorded exit codes
+        run: |
+          set +e
+          cat "$RUNNER_TEMP/codes.txt" | sed 's/^/R026: code: /'
+          bad=$(awk '$2 != 0' "$RUNNER_TEMP/codes.txt" | wc -l)
+          echo "R026: nonzero-count=$bad"
+          if [ "$bad" -ne 0 ]; then
+            echo "R026: VERDICT FAIL"
+            exit 1
+          fi
+          echo "R026: VERDICT PASS"
