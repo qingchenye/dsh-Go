@@ -1,0 +1,169 @@
+name: iOS sideload (unsigned IPA)
+
+# Builds an UNSIGNED iOS .ipa of dsh-go for sideloading. You sign it on your side
+# with ESign / Feather / Sideloadly / AltStore (p12+mobileprovision, or a free
+# Apple ID): no certificates, Apple account or repository secrets are needed here.
+#
+# The app is Android-only upstream: there is no app/ios directory and all native
+# code is Kotlin. This workflow therefore generates a stock Flutter iOS host at
+# build time (tooling/ios/ios_prepare.py), builds the Dart app against it with
+# --no-codesign, and packages Payload/Runner.app as an .ipa.
+#
+# Read docs/ios-sideload.md first — the Android-only features (local engine,
+# root/Shizuku shell, APK self-update) have no iOS implementation and will not
+# work; the client-side features (remote control, chats, forum, webview) are
+# pure Dart.
+#
+# Run it from Actions → "iOS sideload (unsigned IPA)" → Run workflow.
+# Output: the `ios` prerelease of this repository (stable download URL) and the
+# `dsh-go-ios-unsigned` artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: "iOS minimum version"
+        required: false
+        default: "16.0"
+      build_number:
+        description: "CFBundleVersion (empty = UTC timestamp)"
+        required: false
+        default: ""
+      publish_release:
+        description: "Publish the .ipa to the `ios` prerelease (public download link)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.47.7"
+  IOS_DEPLOYMENT_TARGET: ${{ inputs.deployment_target || '16.0' }}
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build unsigned IPA (macOS)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      # Before `flutter pub get`, so .flutter-plugins-dependencies is computed
+      # with ios/ present and CocoaPods sees every plugin.
+      - name: Generate + patch the iOS host project
+        run: python3 tooling/ios/ios_prepare.py
+
+      - name: Optional Dart-side launch guards
+        run: |
+          if [ -f tooling/ios/patch_dart_ios.py ]; then
+            python3 tooling/ios/patch_dart_ios.py
+          else
+            echo "no tooling/ios/patch_dart_ios.py; building unpatched Dart"
+          fi
+
+      - name: Resolve Dart dependencies
+        working-directory: app
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build iOS (release, no codesign)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version:[[:space:]]*\([^+[:space:]]*\).*/\1/p' pubspec.yaml)"
+          BUILD="${{ inputs.build_number }}"
+          [ -n "$BUILD" ] || BUILD="$(date -u +%Y%m%d%H%M)"
+          [ -n "$VERSION" ] || { echo "::error::no version in app/pubspec.yaml"; exit 1; }
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP_BUILD=$BUILD" >> "$GITHUB_ENV"
+
+          flutter build ios --release --no-codesign \
+            --no-tree-shake-icons \
+            --build-name "$VERSION" \
+            --build-number "$BUILD" \
+            --dart-define=DSH_APP_VERSION="$VERSION+$BUILD"
+
+          test -d build/ios/iphoneos/Runner.app
+          test -s ios/Podfile.lock
+          grep -q 'webview_flutter_wkwebview' ios/Podfile.lock || echo "::warning::webview_flutter_wkwebview missing from Podfile.lock"
+
+      - name: Package unsigned IPA
+        working-directory: app
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+          rm -rf build/ios/ipa
+          mkdir -p build/ios/ipa/Payload
+          cp -R "$APP" build/ios/ipa/Payload/
+          (
+            cd build/ios/ipa
+            zip -qry "dsh-go-${APP_VERSION}-ios-unsigned.ipa" Payload
+          )
+          cp "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa" "build/ios/ipa/dsh-go-ios-unsigned.ipa"
+          plutil -lint build/ios/ipa/Payload/Runner.app/Info.plist
+          echo "bundle id: $(plutil -extract CFBundleIdentifier raw build/ios/ipa/Payload/Runner.app/Info.plist)"
+          echo "version:   $(plutil -extract CFBundleShortVersionString raw build/ios/ipa/Payload/Runner.app/Info.plist)"
+          echo "build:     $(plutil -extract CFBundleVersion raw build/ios/ipa/Payload/Runner.app/Info.plist)"
+          lipo -info build/ios/ipa/Payload/Runner.app/Runner
+          ls -lh build/ios/ipa/*.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-ios-unsigned
+          path: app/build/ios/ipa/*.ipa
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish unsigned IPA to the ios prerelease
+        if: ${{ inputs.publish_release }}
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSET="build/ios/ipa/dsh-go-ios-unsigned.ipa"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ios/dsh-go-ios-unsigned.ipa"
+          TITLE="iOS sideload build ${APP_VERSION} (${GITHUB_SHA::7})"
+          NOTES="未签名 iOS IPA（自签侧载）。版本 ${APP_VERSION} (${APP_BUILD})，提交 ${GITHUB_SHA}。
+          用 ESign / Feather / Sideloadly / AltStore 自签后安装；详见 docs/ios-sideload.md。
+          注意：本地引擎、root/Shizuku、APK 自更新等 Android 原生能力在 iOS 上不可用。"
+
+          if gh release view ios --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit ios --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --notes "$NOTES" --prerelease
+            gh release upload ios "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create ios "$ASSET" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" --prerelease
+          fi
+
+          {
+            echo "## iOS 未签名 IPA"
+            echo ""
+            echo "- 下载：$URL"
+            echo "- 版本：${APP_VERSION} (${APP_BUILD})"
+            echo "- 提交：\`${GITHUB_SHA}\`"
+            echo ""
+            echo "自签工具：ESign / Feather / Sideloadly / AltStore。"
+          } >> "$GITHUB_STEP_SUMMARY"
