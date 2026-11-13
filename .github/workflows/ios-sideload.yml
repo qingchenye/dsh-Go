@@ -135,7 +135,9 @@ jobs:
           APP_PATH=""
           if [ -f ios/Engine/.ready ]; then
             echo "== engine prepared: xcodebuild archive path"
-            flutter build ios --release --no-codesign --config-only >"$RUNNER_TEMP/config-only.log" 2>&1 \
+            flutter build ios --release --no-codesign --config-only \
+              --build-name "$VERSION" --build-number "$BUILD" \
+              >"$RUNNER_TEMP/config-only.log" 2>&1 \
               || { echo "::warning::config-only failed"; tail -20 "$RUNNER_TEMP/config-only.log"; }
             archive="$RUNNER_TEMP/Runner.xcarchive"
             rm -rf "$archive"
