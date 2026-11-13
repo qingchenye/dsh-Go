@@ -22,6 +22,10 @@ on:
         description: "Prepare the in-process Node engine (local-engine mode); needs network, ~2 min"
         type: boolean
         default: true
+      full_engine:
+        description: "Also build the iSH Linux guest + engine addons (full engine, +40-60 min, needs Homebrew)"
+        type: boolean
+        default: false
       strip_extensions:
         description: "Remove embedded app extensions (simpler/faster self-signing)"
         type: boolean
@@ -87,6 +91,29 @@ jobs:
           flutter --version
           flutter pub get --enforce-lockfile
           flutter gen-l10n
+
+      # The Xcode "Run Script" phase builds the iSH Linux guest itself and needs
+      # ld.lld + meson + ninja; upstream's engine job installs exactly these.
+      - name: Install the iSH engine toolchain
+        if: ${{ inputs.prepare_engine && inputs.full_engine }}
+        run: |
+          set -euo pipefail
+          brew install llvm lld
+          python3 -m venv "$RUNNER_TEMP/ish-tools"
+          "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet meson==1.7.2 ninja==1.11.1.4
+          {
+            echo "$RUNNER_TEMP/ish-tools/bin"
+            echo "$(brew --prefix llvm)/bin"
+            echo "$(brew --prefix lld)/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build the iSH guest engine
+        if: ${{ inputs.prepare_engine && inputs.full_engine }}
+        run: |
+          set -uo pipefail
+          export PATH="$(brew --prefix lld)/bin:$(brew --prefix llvm)/bin:$RUNNER_TEMP/ish-tools/bin:$PATH"
+          set -o pipefail
+          bash tooling/ios/build-ish.sh iphoneos app/ios/Engine/build/iphoneos/guest 2>&1 | tee "$RUNNER_TEMP/build-ish.log"
 
       # With the engine prepared, `flutter build ios` is not the path upstream
       # uses: their engine job runs `xcodebuild archive` with signing disabled
@@ -156,12 +183,21 @@ jobs:
           fi
           find build/ios/ipa/Payload -name 'kernel_blob.bin' -print -exec rm -f {} +
 
+          # The archive only exists when the iSH toolchain was installed; tell
+          # the two packages apart instead of clobbering the small one.
+          ENGINE=no
+          [ -d "build/ios/ipa/Payload/Runner.app/Frameworks/DshNodeHost.framework" ] && ENGINE=yes
+          ASSET_NAME="dsh-go-ios-unsigned.ipa"
+          [ "$ENGINE" = "yes" ] && ASSET_NAME="dsh-go-ios-unsigned-full.ipa"
+          echo "ENGINE_INCLUDED=$ENGINE" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+
           (
             cd build/ios/ipa
             /usr/bin/ditto -c -k --keepParent Payload "unsigned.ipa"
           )
           mv build/ios/ipa/unsigned.ipa "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa"
-          cp "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa" build/ios/ipa/dsh-go-ios-unsigned.ipa
+          cp "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa" "build/ios/ipa/$ASSET_NAME"
 
           plutil -lint build/ios/ipa/Payload/Runner.app/Info.plist
           echo "bundle id: $(plutil -extract CFBundleIdentifier raw build/ios/ipa/Payload/Runner.app/Info.plist)"
@@ -171,9 +207,6 @@ jobs:
           lipo -info build/ios/ipa/Payload/Runner.app/Runner
           echo "--- Frameworks:"
           ls build/ios/ipa/Payload/Runner.app/Frameworks | head -40
-          ENGINE=no
-          [ -d "build/ios/ipa/Payload/Runner.app/Frameworks/DshNodeHost.framework" ] && ENGINE=yes
-          echo "ENGINE_INCLUDED=$ENGINE" >> "$GITHUB_ENV"
           ls -lh build/ios/ipa/*.ipa
 
       - name: Upload artifact
@@ -193,6 +226,7 @@ jobs:
             ${{ runner.temp }}/flutter-build.log
             ${{ runner.temp }}/config-only.log
             ${{ runner.temp }}/xcodebuild-archive.log
+            ${{ runner.temp }}/build-ish.log
             ${{ runner.temp }}/prepare-engine.log
           if-no-files-found: ignore
           retention-days: 14
@@ -204,8 +238,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ASSET="build/ios/ipa/dsh-go-ios-unsigned.ipa"
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ios/dsh-go-ios-unsigned.ipa"
+          ASSET="build/ios/ipa/${ASSET_NAME}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ios/${ASSET_NAME}"
           NOTES="未签名 iOS IPA（自签侧载），构建自 \`${{ inputs.source_ref }}\`（提交 $(git -C .. rev-parse --short HEAD)）。
           本机引擎：${ENGINE_INCLUDED}（yes = 可在手机上直接跑 DSH；no = 只能连远程主机）。
           用 ESign / Feather / Sideloadly / AltStore 自签安装；详见 docs/ios-sideload.md。"
