@@ -6,7 +6,7 @@ name: iOS sideload (unsigned IPA)
 #
 # IMPORTANT: upstream `main` has no iOS project at all (all native code is
 # Kotlin). The iOS port lives on `feat/ios-foundation` (Swift Runner, all
-# channels, in-process Node engine). This workflow builds *that branch* by
+# channels, in-process NodeMobile engine). This workflow builds *that branch* by
 # default; override `source_ref` once iOS lands on main.
 #
 # Run: Actions -> "iOS sideload (unsigned IPA)" -> Run workflow.
@@ -19,7 +19,7 @@ on:
         required: false
         default: "feat/ios-foundation"
       prepare_engine:
-        description: "Prepare the in-process Node engine (local-engine mode); needs network, ~10 min"
+        description: "Prepare the in-process Node engine (local-engine mode); needs network, ~2 min"
         type: boolean
         default: true
       strip_extensions:
@@ -33,10 +33,6 @@ on:
 
 permissions:
   contents: write
-
-concurrency:
-  group: ios-sideload-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   FLUTTER_VERSION: "3.47.7"
@@ -92,6 +88,11 @@ jobs:
           flutter pub get --enforce-lockfile
           flutter gen-l10n
 
+      # With the engine prepared, `flutter build ios` is not the path upstream
+      # uses: their engine job runs `xcodebuild archive` with signing disabled
+      # (tooling/ios/check-archive.sh). That path embeds the engine frameworks
+      # and produces the same Runner.app Flutter would. Fall back to a plain
+      # remote-only Flutter build when anything above fails.
       - name: Build iOS (release, no codesign)
         id: build
         continue-on-error: true
@@ -103,48 +104,64 @@ jobs:
           echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "APP_BUILD=$BUILD" >> "$GITHUB_ENV"
           echo "::notice::dsh-go $VERSION ($BUILD)"
-          set -o pipefail
-          bash ../tooling/ios/build.sh --release --no-codesign \
-            --build-name "$VERSION" --build-number "$BUILD" 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
-          test -d build/ios/iphoneos/Runner.app
 
-      # A half-prepared engine can make the embed phase fail; retry without it.
-      - name: Fallback build without engine
-        if: ${{ steps.build.outcome == 'failure' }}
-        working-directory: app
-        run: |
-          set -euo pipefail
-          if [ -d ../app/ios/Engine ] || [ -d ios/Engine ]; then
-            echo "::warning::first build failed; retrying with the engine removed (remote-only app)"
+          APP_PATH=""
+          if [ -f ios/Engine/.ready ]; then
+            echo "== engine prepared: xcodebuild archive path"
+            flutter build ios --release --no-codesign --config-only >"$RUNNER_TEMP/config-only.log" 2>&1 \
+              || { echo "::warning::config-only failed"; tail -20 "$RUNNER_TEMP/config-only.log"; }
+            archive="$RUNNER_TEMP/Runner.xcarchive"
+            rm -rf "$archive"
+            set -o pipefail
+            if xcodebuild archive \
+                  -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+                  -destination 'generic/platform=iOS' -archivePath "$archive" \
+                  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+                  2>&1 | tee "$RUNNER_TEMP/xcodebuild-archive.log"; then
+              [ -d "$archive/Products/Applications/Runner.app" ] && APP_PATH="$archive/Products/Applications/Runner.app"
+            fi
+            # check-archive.sh does exactly this: the archive is the app.
+            if [ -n "$APP_PATH" ] && [ -d "$APP_PATH/Frameworks" ]; then
+              echo "::notice::archive produced $APP_PATH"
+            else
+              echo "::warning::engine archive build failed; falling back to a remote-only build"
+              APP_PATH=""
+            fi
+          fi
+
+          if [ -z "$APP_PATH" ]; then
             rm -rf ios/Engine
             bash ../tooling/ios/build.sh --release --no-codesign \
-              --build-name "${APP_VERSION:-1.0.12}" --build-number "${APP_BUILD:-$(date -u +%Y%m%d%H%M)}"
-            test -d build/ios/iphoneos/Runner.app
-          else
-            echo "::error::build failed and no engine directory to blame; see the uploaded log"
-            exit 1
+              --build-name "$VERSION" --build-number "$BUILD" 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
+            APP_PATH="build/ios/iphoneos/Runner.app"
           fi
+
+          test -d "$APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
       - name: Package unsigned IPA
         working-directory: app
         run: |
           set -euo pipefail
-          APP="build/ios/iphoneos/Runner.app"
+          APP="${APP_PATH:-build/ios/iphoneos/Runner.app}"
           test -d "$APP"
+          echo "packaging $APP"
           rm -rf build/ios/ipa
           mkdir -p build/ios/ipa/Payload
-          cp -R "$APP" build/ios/ipa/Payload/
+          cp -R "$APP" build/ios/ipa/Payload/Runner.app
 
           if [ "${{ inputs.strip_extensions }}" = "true" ] && [ -d build/ios/ipa/Payload/Runner.app/PlugIns ]; then
             echo "removing embedded extensions: $(ls build/ios/ipa/Payload/Runner.app/PlugIns)"
             rm -rf build/ios/ipa/Payload/Runner.app/PlugIns
           fi
-          # Debug leftovers would make the app fall back to JIT; none expected.
           find build/ios/ipa/Payload -name 'kernel_blob.bin' -print -exec rm -f {} +
 
-          IPA="build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa"
-          (cd build/ios/ipa && /usr/bin/ditto -c -k --keepParent Payload "$IPA")
-          cp "$IPA" build/ios/ipa/dsh-go-ios-unsigned.ipa
+          (
+            cd build/ios/ipa
+            /usr/bin/ditto -c -k --keepParent Payload "unsigned.ipa"
+          )
+          mv build/ios/ipa/unsigned.ipa "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa"
+          cp "build/ios/ipa/dsh-go-${APP_VERSION}-ios-unsigned.ipa" build/ios/ipa/dsh-go-ios-unsigned.ipa
 
           plutil -lint build/ios/ipa/Payload/Runner.app/Info.plist
           echo "bundle id: $(plutil -extract CFBundleIdentifier raw build/ios/ipa/Payload/Runner.app/Info.plist)"
@@ -152,11 +169,10 @@ jobs:
           echo "build:     $(plutil -extract CFBundleVersion raw build/ios/ipa/Payload/Runner.app/Info.plist)"
           echo "min iOS:   $(plutil -extract MinimumOSVersion raw build/ios/ipa/Payload/Runner.app/Frameworks/App.framework/Info.plist 2>/dev/null || true)"
           lipo -info build/ios/ipa/Payload/Runner.app/Runner
-          echo "--- Frameworks:"; ls build/ios/ipa/Payload/Runner.app/Frameworks | head -40
+          echo "--- Frameworks:"
+          ls build/ios/ipa/Payload/Runner.app/Frameworks | head -40
           ENGINE=no
-          for f in DshNodeHost; do
-            [ -d "build/ios/ipa/Payload/Runner.app/Frameworks/$f.framework" ] && ENGINE=yes
-          done
+          [ -d "build/ios/ipa/Payload/Runner.app/Frameworks/DshNodeHost.framework" ] && ENGINE=yes
           echo "ENGINE_INCLUDED=$ENGINE" >> "$GITHUB_ENV"
           ls -lh build/ios/ipa/*.ipa
 
@@ -168,13 +184,15 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Keep the build log
+      - name: Keep the build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ios-build-log
           path: |
             ${{ runner.temp }}/flutter-build.log
+            ${{ runner.temp }}/config-only.log
+            ${{ runner.temp }}/xcodebuild-archive.log
             ${{ runner.temp }}/prepare-engine.log
           if-no-files-found: ignore
           retention-days: 14
@@ -188,7 +206,7 @@ jobs:
           set -euo pipefail
           ASSET="build/ios/ipa/dsh-go-ios-unsigned.ipa"
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/ios/dsh-go-ios-unsigned.ipa"
-          NOTES="未签名 iOS IPA（自签侧载），构建自 \`${GITHUB_REPOSITORY}@${{ inputs.source_ref }}\`（提交 ${GITHUB_SHA}）。
+          NOTES="未签名 iOS IPA（自签侧载），构建自 \`${{ inputs.source_ref }}\`（提交 $(git -C .. rev-parse --short HEAD)）。
           本机引擎：${ENGINE_INCLUDED}（yes = 可在手机上直接跑 DSH；no = 只能连远程主机）。
           用 ESign / Feather / Sideloadly / AltStore 自签安装；详见 docs/ios-sideload.md。"
 
@@ -208,7 +226,5 @@ jobs:
             echo "- 下载：$URL"
             echo "- 版本：${APP_VERSION} (${APP_BUILD})"
             echo "- 本机引擎：${ENGINE_INCLUDED}"
-            echo "- 提交：\`${GITHUB_SHA}\`（${{ inputs.source_ref }}）"
-            echo ""
-            echo "自签工具：ESign / Feather / Sideloadly / AltStore。"
+            echo "- 分支：${{ inputs.source_ref }}"
           } >> "$GITHUB_STEP_SUMMARY"
